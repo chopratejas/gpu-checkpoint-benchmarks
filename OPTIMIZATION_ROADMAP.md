@@ -42,32 +42,37 @@ cd /root/gpu-load
 
 ---
 
-## 🚀 Phase 2: CRIU Upgrade (2 hours) → Target: 4-6s restore
+## ⚠️ Phase 2: Advanced CRIU Optimizations (FUTURE - Requires Code Changes)
 
-### Upgrade CRIU to 4.2+ for Parallel GPU Restore:
+**NOTE**: CRIU v4.1.1 is the LATEST stable release. There is NO version 4.2 or higher available.
 
-```bash
-# Check current version
-criu --version  # Currently 4.1.1
+Any further optimizations beyond your current 6.3s achievement would require:
 
-# Upgrade via PPA
-sudo add-apt-repository ppa:criu/ppa
-sudo apt update
-sudo apt install criu
+### Option A: Implement Parallel Memory Restore (8-12 weeks development)
+- Modify CRIU source code to use threading in PIE restorer
+- Use raw `clone()` syscalls (not pthread - PIE has no libc access)
+- Reference: AMDGPU plugin's threading pattern as proof of concept
+- **Potential gain**: 2-3x memory restore speedup
+- **Risk**: High complexity, requires deep CRIU knowledge
 
-# Verify upgrade
-criu --version  # Should be 4.2.x or higher
+### Option B: Implement io_uring for Async I/O (4-6 weeks development)
+- Add liburing integration to CRIU page reading layer
+- Batch I/O submissions for better NVMe utilization
+- **Potential gain**: 20-40% I/O speedup
+- **Risk**: Medium, requires Linux 5.1+ kernel
 
-# Re-run benchmark
-cd /root/gpu-load
-./benchmark-criu.py
-# Expected: 4-6s restore (34% faster due to parallel restore)
-```
+### Option C: Simple Readahead (1-2 days)
+- Use `posix_fadvise(POSIX_FADV_WILLNEED)` to prefetch pages
+- Much simpler than threading or io_uring
+- **Potential gain**: 15-25% speedup (6.3s → ~5s)
+- **Risk**: Low, simple kernel hint
 
-### Expected Results:
-- **Restore time**: **4-6 seconds**
-- **Speedup**: **10-15x vs baseline** ✅✅✅
-- **No code changes needed** - parallel restore is automatic
+### Expected Results (IF Implemented):
+- **Restore time**: **4-5 seconds** (with threading + io_uring)
+- **Speedup**: **12-15x vs baseline**
+- **Effort**: Significant (12-16 weeks development + testing)
+
+**Recommendation**: Your current 6.3s is already world-class. Phase 2 optimizations require significant CRIU development effort.
 
 ---
 
@@ -89,10 +94,13 @@ cd /root/gpu-load
 
 | Phase | Restore Time | vs Baseline | Effort | Cost |
 |-------|-------------|-------------|--------|------|
-| **Current** | 11s | 5.4x | ✅ Done | Free |
-| **Phase 1** | 6-8s | 8-10x | 30 min | Free |
-| **Phase 2** | 4-6s | 10-15x | 2 hours | Free |
-| **Phase 3** | 2-3s | 20-30x | N/A | $$$ |
+| **Baseline** | 59.2s | 1x | - | - |
+| **Initial (GPU 0.50)** | 11s | 5.4x | ✅ Done | Free |
+| **Phase 1 (GPU 0.30 + enforce-eager)** | **6.3s** | **9.4x** | ✅ Done | Free |
+| **Phase 2 (CRIU code changes)** | 4-5s | 12-15x | 12-16 weeks | Free (dev time) |
+| **Phase 3 (Commercial)** | 2-3s | 20-30x | N/A | $$$ |
+
+**Note**: Phase 2 would require implementing parallel restore in CRIU source code. Your current Phase 1 achievement of 6.3s is already world-class!
 
 ---
 
@@ -130,10 +138,11 @@ cd /root/gpu-load
    - `--enforce-eager` trades inference speed for restore speed
    - Worth it for serverless cold starts
 
-3. **Parallel Restore (CRIU 4.2+) is Critical**
-   - 34% speedup from parallel GPU+CPU restore
-   - Requires CRIU upgrade
-   - No code changes needed
+3. **Further Parallelization Requires CRIU Source Changes**
+   - CRIU v4.1.1 is latest (no 4.2 exists!)
+   - Parallel restore would require modifying CRIU PIE restorer code
+   - Must use raw `clone()` syscalls, not pthread (PIE context limitation)
+   - AMDGPU plugin proves threading is architecturally feasible
 
 4. **Theoretical Minimum is 1-2s**
    - PCIe bandwidth: ~0.4-0.8s for GPU upload

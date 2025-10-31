@@ -1,5 +1,18 @@
 # CRIU Parallel Restore - Implementation Guide
 
+## ⚠️ IMPORTANT: Code Corrections Required
+
+**This implementation guide was validated against CRIU v4.1.1 source code. Critical findings:**
+
+1. **PIE Threading Limitation**: PIE restorer has NO access to pthread library. Must use raw `clone()` syscalls, not `pthread_create()`.
+2. **GPU Context Pooling**: CUDA plugin delegates to external `cuda-checkpoint` binary. Context pooling must be implemented there, not in plugin.
+3. **Syscall Wrappers**: CRIU uses `sys_dup2()` or `sys_dup3()`, not `sys_dup()`.
+4. **Performance Expectations**: Realistic speedup is 2-3x total (not 5-10x due to Amdahl's law).
+
+See corrections throughout this document marked with ⚠️.
+
+---
+
 ## Quick Start for Developers
 
 This guide provides concrete, copy-paste-ready code for implementing parallel restore optimizations in CRIU.
@@ -12,10 +25,16 @@ This guide provides concrete, copy-paste-ready code for implementing parallel re
 
 **File**: `criu/pie/restorer.c`
 
-Add these includes at the top:
+⚠️ **CORRECTION**: PIE restorer cannot use pthread library! The code below shows pthread for illustration, but **must be rewritten to use raw `clone()` syscalls**.
+
+Reference the AMDGPU plugin (`plugins/amdgpu/amdgpu_plugin.c:1587-1605`) which successfully uses pthread because it runs in plugin context (has full libc access), not PIE context.
+
+Add these includes at the top (note: pthread.h won't work in PIE, shown for reference only):
 
 ```c
-#include <pthread.h>
+// ⚠️ WARNING: pthread.h NOT available in PIE restorer context!
+// This code needs rewrite to use sys_clone() instead
+#include <pthread.h>  // ← NOT AVAILABLE IN PIE
 #include <errno.h>
 ```
 
@@ -59,11 +78,18 @@ struct page_restore_pool {
 
 ### Step 2: Worker Thread Implementation
 
+⚠️ **CORRECTION**: This pthread-based code will NOT compile in PIE restorer. Must be rewritten to:
+- Use `sys_clone()` with manual stack allocation
+- Use futex-based synchronization (not pthread_join)
+- See CRIU's existing PIE threading in `criu/pie/util.c` for patterns
+
 Add after the structure definitions:
 
 ```c
 /*
- * Worker thread for parallel page restoration
+ * ⚠️ Worker thread for parallel page restoration
+ * NOTE: This uses pthread for illustration but MUST be rewritten
+ * to use raw clone() syscalls for PIE context!
  * Each worker processes a subset of VMAs independently
  */
 static void *page_restore_worker_thread(void *arg)
@@ -298,7 +324,13 @@ static int restore_vma_ios_parallel(struct task_restore_args *args)
 	/* Create per-worker file descriptors */
 	for (i = 0; i < pool.nr_workers; i++) {
 		pool.workers[i].worker_idx = i;
-		pool.workers[i].pages_fd = sys_dup(pool.pages_fd_orig);
+		// ⚠️ CORRECTED: sys_dup() doesn't exist, use sys_dup2()
+		int newfd = sys_dup2(pool.pages_fd_orig, -1);  // dup2 with -1 allocates new fd
+		if (newfd < 0) {
+			// Alternative: use sys_fcntl with F_DUPFD
+			newfd = sys_fcntl(pool.pages_fd_orig, F_DUPFD, 0);
+		}
+		pool.workers[i].pages_fd = newfd;
 		pool.workers[i].auto_dedup = pool.auto_dedup;
 		
 		if (pool.workers[i].pages_fd < 0) {
@@ -778,13 +810,31 @@ static int restore_vma_ios_with_uring(struct task_restore_args *args)
 
 ## Priority 3: GPU Context Pool
 
-### Implementation for CUDA Plugin
+⚠️ **CRITICAL CORRECTION**: This code CANNOT go in `plugins/cuda/cuda_plugin.c`!
 
-**File**: `plugins/cuda/cuda_plugin.c`
+**Why**: The CUDA plugin does NOT link against CUDA libraries. It delegates all GPU operations to the external `cuda-checkpoint` utility binary via:
+```c
+// plugins/cuda/cuda_plugin.c:507
+cuda_process_checkpoint_action(pid, ACTION_RESTORE, 0, ...);
+```
+
+**Where to implement**: Context pooling must be added to the `cuda-checkpoint` utility source code, not the plugin.
+
+**Architecture**:
+```
+CRIU → cuda_plugin.c → calls → cuda-checkpoint binary (has CUDA API access)
+                                    ↑
+                              Context pool goes HERE
+```
+
+### Implementation for cuda-checkpoint Utility
+
+**File**: `cuda-checkpoint` source (external to CRIU, needs CUDA SDK)
 
 Add after includes:
 
 ```c
+#include <cuda.h>
 #include <pthread.h>
 
 /* GPU Context Pool */

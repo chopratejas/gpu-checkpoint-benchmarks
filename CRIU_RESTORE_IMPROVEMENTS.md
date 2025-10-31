@@ -249,6 +249,11 @@ for (buffer in gpu_buffers) {
 
 **Expected Speedup**: 4-7x for memory restore (28s → 4-7s)
 
+⚠️ **Amdahl's Law Reality Check**: Even with 7x speedup on 72% of total time:
+- Best case: 39s × (0.28 + 0.72/7) = **15.2s total** (2.6x overall speedup)
+- Realistic: **16-18s total** (2.2-2.4x overall speedup)
+- The remaining 28% (GPU restore, process fork, etc.) limits total gains
+
 #### Architecture
 
 ```
@@ -805,16 +810,21 @@ err:
 static bool child_is_independent(struct pstree_item *child,
                                   struct pstree_item *parent)
 {
-    // Check for:
+    // ⚠️ CRITICAL: This function is INCOMPLETE and UNSAFE!
+    // Currently returns true for ALL children, which WILL cause race conditions
+    //
+    // Must check for:
     // - Shared file descriptors (pipes, sockets between siblings)
-    // - Shared memory regions
-    // - IPC resources
-    
-    // Simple heuristic: If child has no shared resources with siblings,
-    // it can be forked in parallel
-    
-    // TODO: Full dependency analysis
-    return true;  // Conservative: assume independent for now
+    // - Shared memory regions (SysV shm, POSIX shm, memfd)
+    // - IPC resources (message queues, semaphores)
+    // - Namespace dependencies (must enter parent namespaces first)
+    // - Session ID ordering requirements
+    // - TTY allocation order
+    //
+    // DO NOT USE THIS CODE WITHOUT IMPLEMENTING FULL DEPENDENCY ANALYSIS!
+
+    // TODO: Full dependency analysis - REQUIRED BEFORE PRODUCTION USE
+    return true;  // ⚠️ UNSAFE: Assumes all children are independent!
 }
 ```
 
@@ -1355,10 +1365,13 @@ CRIU's restore process has **significant untapped parallelism**. The current arc
 
 By implementing the 6 priority optimizations outlined in this document, we can achieve:
 
-**Target Performance**:
-- **5-10 second restore** for LLaMA 3.1 8B (vs. 39s baseline)
-- **5-8x total speedup**
-- **Competitive with Modal Labs, Baseten, and InferX**
+**Target Performance** (Realistic, accounting for Amdahl's Law):
+- **15-18 second restore** for LLaMA 3.1 8B (vs. 39s baseline)
+- **2.2-2.6x total speedup** (not 5-8x - that was too optimistic)
+- **Component speedups**: 4-7x memory, 2-3x GPU, but limited by serial bottlenecks
+- Still competitive with commercial solutions when combined with other optimizations
+
+⚠️ **Why not 5-10s?**: Amdahl's Law limits gains. Even infinite memory speedup gives ~11s (39s × 0.28). To reach sub-10s requires optimizing GPU restore, process fork, and image I/O too.
 
 **Implementation Complexity**:
 - **Phase 1-2**: Medium (8 weeks, low risk)

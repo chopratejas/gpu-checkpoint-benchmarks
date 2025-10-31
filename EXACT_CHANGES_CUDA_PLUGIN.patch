@@ -1,0 +1,328 @@
+================================================================================
+EXACT CHANGES FOR CRIU CUDA CONTEXT POOL
+================================================================================
+
+File: /root/criu/plugins/cuda/cuda_plugin.c (659 lines)
+
+This patch adds GPU context pooling to eliminate ~1.0s context creation overhead.
+
+Expected result: 5.7s → 5.0s restore time (12% faster)
+
+================================================================================
+CHANGE 1: Add CUDA Driver API include
+================================================================================
+
+Location: After line 9 (after #include "cuda_parallel_restore.h")
+
+ADD THIS LINE:
+---
+#include <cuda.h>
+---
+
+Result: Line 10 becomes: #include <cuda.h>
+        Line 11 becomes: (blank line)
+        Line 12 becomes: #include <common/list.h>
+
+================================================================================
+CHANGE 2: Add GPU Context Pool Global Variables
+================================================================================
+
+Location: After line 19 (after #include <sys/wait.h>), before line 21
+
+ADD THESE LINES:
+---
+
+/* GPU Context Pool for faster restore (Option 2 implementation) */
+static CUcontext g_warm_context = NULL;
+static CUdevice g_warm_device = 0;
+static bool g_context_pool_enabled = false;
+static bool g_context_initialized = false;
+static pthread_mutex_t g_context_lock = PTHREAD_MUTEX_INITIALIZER;
+
+---
+
+Result: Lines 20-27 are new code
+        Line 28 becomes: (blank line)
+        Line 29 becomes: /* cuda-checkpoint binary should live in your PATH */
+
+================================================================================
+CHANGE 3: Add Context Pool Functions
+================================================================================
+
+Location: After line 570 (after closing brace of is_cuda_device_available()),
+          before line 572 (int cuda_plugin_init)
+
+ADD THESE FUNCTIONS:
+---
+
+/*
+ * Initialize warm GPU context pool
+ * Called once during CRIU plugin initialization (RESTORE stage)
+ */
+static int init_gpu_context_pool(void)
+{
+	CUresult res;
+
+	pthread_mutex_lock(&g_context_lock);
+
+	if (g_context_initialized) {
+		pr_info("GPU context pool already initialized\n");
+		pthread_mutex_unlock(&g_context_lock);
+		return 0;
+	}
+
+	pr_info("Initializing GPU context pool...\n");
+
+	/* Initialize CUDA driver */
+	res = cuInit(0);
+	if (res != CUDA_SUCCESS) {
+		pr_err("cuInit failed: %d\n", res);
+		pthread_mutex_unlock(&g_context_lock);
+		return -1;
+	}
+
+	/* Get first GPU device */
+	res = cuDeviceGet(&g_warm_device, 0);
+	if (res != CUDA_SUCCESS) {
+		pr_err("cuDeviceGet failed: %d\n", res);
+		pthread_mutex_unlock(&g_context_lock);
+		return -1;
+	}
+
+	/* Retain primary context (auto-creates if needed) */
+	res = cuDevicePrimaryCtxRetain(&g_warm_context, g_warm_device);
+	if (res != CUDA_SUCCESS) {
+		pr_err("cuDevicePrimaryCtxRetain failed: %d\n", res);
+		pthread_mutex_unlock(&g_context_lock);
+		return -1;
+	}
+
+	/* Set as current context */
+	res = cuCtxSetCurrent(g_warm_context);
+	if (res != CUDA_SUCCESS) {
+		pr_err("cuCtxSetCurrent failed: %d\n", res);
+		cuDevicePrimaryCtxRelease(g_warm_device);
+		g_warm_context = NULL;
+		pthread_mutex_unlock(&g_context_lock);
+		return -1;
+	}
+
+	g_context_initialized = true;
+	pr_info("GPU context pool initialized successfully: ctx=%p device=%d\n",
+	        (void*)g_warm_context, g_warm_device);
+
+	pthread_mutex_unlock(&g_context_lock);
+	return 0;
+}
+
+/*
+ * Cleanup GPU context pool
+ * Called during CRIU plugin finalization
+ */
+static void fini_gpu_context_pool(void)
+{
+	pthread_mutex_lock(&g_context_lock);
+
+	if (!g_context_initialized) {
+		pthread_mutex_unlock(&g_context_lock);
+		return;
+	}
+
+	pr_info("Cleaning up GPU context pool\n");
+
+	if (g_warm_context != NULL) {
+		cuCtxSetCurrent(NULL);
+		cuDevicePrimaryCtxRelease(g_warm_device);
+		g_warm_context = NULL;
+	}
+
+	g_context_initialized = false;
+	pthread_mutex_unlock(&g_context_lock);
+}
+
+/*
+ * Pre-warm context before restore operation
+ * Ensures context is current before cuda-checkpoint runs
+ */
+static int prewarm_context_for_restore(void)
+{
+	CUresult res;
+
+	if (!g_context_pool_enabled || !g_context_initialized) {
+		return 0; /* Context pool not enabled */
+	}
+
+	pthread_mutex_lock(&g_context_lock);
+
+	/* Make warm context current */
+	res = cuCtxSetCurrent(g_warm_context);
+	if (res != CUDA_SUCCESS) {
+		pr_warn("Failed to set warm context as current: %d\n", res);
+		pthread_mutex_unlock(&g_context_lock);
+		return -1;
+	}
+
+	pr_debug("Warm context set as current for restore\n");
+
+	pthread_mutex_unlock(&g_context_lock);
+	return 0;
+}
+
+---
+
+Result: Lines 571-680 are new functions
+        Line 681 becomes: int cuda_plugin_init(int stage)
+
+================================================================================
+CHANGE 4: Modify cuda_plugin_init() to Enable Context Pool
+================================================================================
+
+Location: Inside cuda_plugin_init(), after line 625 (parallel restore init block),
+          before line 627 (set_compel_interrupt_only_mode)
+
+FIND THIS CODE (lines 617-626):
+---
+	/* In the RESTORE stage initialize parallel GPU memory restore */
+	if (stage == CR_PLUGIN_STAGE__RESTORE) {
+		cuda_parallel_config_t config;
+		cuda_parallel_config_from_env(&config);
+
+		if (cuda_parallel_restore_init(&config) < 0) {
+			pr_warn("Failed to initialize CUDA parallel restore, using standard path\n");
+			/* Continue with standard restore - not a fatal error */
+		}
+	}
+---
+
+ADD AFTER THE CLOSING BRACE (after line 626), BEFORE line 627:
+---
+
+		/* Initialize GPU context pool if enabled */
+		const char *pool_env = getenv("CRIU_CUDA_CONTEXT_POOL");
+		if (pool_env && atoi(pool_env) == 1) {
+			g_context_pool_enabled = true;
+
+			if (init_gpu_context_pool() < 0) {
+				pr_warn("Failed to initialize GPU context pool, continuing without it\n");
+				g_context_pool_enabled = false;
+			} else {
+				pr_info("GPU context pool ENABLED - expect faster restore\n");
+			}
+		}
+---
+
+Result: Lines 627-637 are new code
+        Line 638 becomes: set_compel_interrupt_only_mode();
+
+================================================================================
+CHANGE 5: Modify resume_device() to Use Warm Context
+================================================================================
+
+Location: Inside resume_device(), after line 514 (parallel restore fallback check),
+          before line 516 (pr_debug line)
+
+FIND THIS CODE (lines 514-517):
+---
+		if (parallel_ret == -ENOTSUP || parallel_ret < 0) {
+			/* Fallback to standard cuda-checkpoint restore */
+			pr_debug("Using standard cuda-checkpoint restore for pid %d\n", pid);
+			status = cuda_process_checkpoint_action(pid, ACTION_RESTORE, 0, msg_buf, sizeof(msg_buf));
+---
+
+INSERT AFTER LINE 515 (/* Fallback comment */), BEFORE LINE 516 (pr_debug):
+---
+			/* Pre-warm context for faster restore */
+			prewarm_context_for_restore();
+
+---
+
+Result: Lines 516-517 are new code
+        Line 518 becomes: pr_debug("Using standard cuda-checkpoint restore for pid %d\n", pid);
+
+================================================================================
+CHANGE 6: Modify cuda_plugin_fini() to Cleanup Context Pool
+================================================================================
+
+Location: Inside cuda_plugin_fini(), at the end of RESTORE stage block
+
+FIND THIS CODE (line 655-657):
+---
+	/* In the RESTORE stage cleanup parallel GPU memory restore */
+	if (stage == CR_PLUGIN_STAGE__RESTORE) {
+		cuda_parallel_restore_fini();
+---
+
+ADD AFTER cuda_parallel_restore_fini(); (after line 657), BEFORE closing brace:
+---
+
+		/* Cleanup GPU context pool */
+		if (g_context_pool_enabled) {
+			fini_gpu_context_pool();
+		}
+---
+
+Result: Lines 658-661 are new code
+        Line 662 becomes: closing brace of if (stage == CR_PLUGIN_STAGE__RESTORE)
+
+================================================================================
+SUMMARY OF CHANGES
+================================================================================
+
+Total lines added: ~180
+Total lines removed: 0
+Functions added: 3 (init_gpu_context_pool, fini_gpu_context_pool, prewarm_context_for_restore)
+Functions modified: 3 (cuda_plugin_init, resume_device, cuda_plugin_fini)
+
+New file size: ~840 lines (was 659)
+
+================================================================================
+VERIFICATION CHECKLIST
+================================================================================
+
+After applying changes, verify:
+
+1. [ ] #include <cuda.h> is present after line 9
+2. [ ] Global variables defined around line 20-27
+3. [ ] Three new functions defined around line 571-680
+4. [ ] cuda_plugin_init() has context pool init code
+5. [ ] resume_device() calls prewarm_context_for_restore()
+6. [ ] cuda_plugin_fini() calls fini_gpu_context_pool()
+
+Build test:
+   cd /root/criu && make clean && make
+
+Expected: No compilation errors
+
+Look for symbols:
+   nm plugins/cuda/cuda_plugin.so | grep -E "(warm|pool)"
+
+Expected:
+   init_gpu_context_pool
+   fini_gpu_context_pool
+   prewarm_context_for_restore
+   g_warm_context
+   g_context_pool_enabled
+
+================================================================================
+TESTING COMMANDS
+================================================================================
+
+# Enable context pool
+export CRIU_CUDA_CONTEXT_POOL=1
+
+# Test restore
+podman container restore --keep vllm-llm-demo 2>&1 | grep -i "context pool"
+
+Expected output:
+  "Initializing GPU context pool..."
+  "GPU context pool initialized successfully: ctx=0x... device=0"
+  "GPU context pool ENABLED - expect faster restore"
+
+# Benchmark
+time (podman stop vllm-llm-demo && podman container restore --keep vllm-llm-demo)
+
+Expected: ~5.0s (down from 5.7s)
+
+================================================================================
+END OF PATCH
+================================================================================

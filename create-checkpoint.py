@@ -93,17 +93,20 @@ def start_vllm_container(env_vars: dict[str, str]) -> None:
     cont_name = env_vars.get("CONT_NAME", "vllm-checkpoint")
     model_id = env_vars.get("MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
     api_port = env_vars.get("API_PORT", "8000")
+    max_model_len = env_vars.get("MAX_MODEL_LEN", "4096")
+    gpu_memory_util = env_vars.get("GPU_MEMORY_UTIL", "0.90")
 
     console.print(f"[cyan]Starting vLLM container: {cont_name}[/cyan]")
     console.print(f"[cyan]Model: {model_id}[/cyan]")
     console.print(f"[cyan]Port: {api_port}[/cyan]")
+    console.print(f"[cyan]Max model length: {max_model_len}[/cyan]")
+    console.print(f"[cyan]GPU memory utilization: {gpu_memory_util}[/cyan]")
 
     cmd = [
         "podman", "run", "-d",
         "--name", cont_name,
         "--device", "/dev/null:/dev/null:rwm",
         "--privileged",
-        "--security-opt=label=disable",
         "--security-opt", "seccomp=/etc/containers/seccomp.d/no-io-uring.json",
         "--device", "/dev/nvidia0",
         "--device", "/dev/nvidiactl",
@@ -119,11 +122,11 @@ def start_vllm_container(env_vars: dict[str, str]) -> None:
         "--model", model_id,
         "--host", "0.0.0.0",
         "--port", api_port,
-        "--gpu-memory-utilization", "0.30",  # Further reduced to 0.30 for faster restore
-        "--max-model-len", "1024",  # Reduced to 1024 for minimal KV cache
+        "--gpu-memory-utilization", gpu_memory_util,
+        "--max-model-len", max_model_len,
         "--trust-remote-code",
-        "--load-format", "safetensors",  # Use mmap for file-backed memory
-        "--enforce-eager"  # Disable CUDA graphs for CRIU compatibility
+        "--load-format", "safetensors",
+        "--enforce-eager"
     ]
 
     result = run_command(cmd, capture=True)
@@ -190,7 +193,6 @@ def create_checkpoint(env_vars: dict[str, str]) -> tuple[str, float]:
 
     cmd = [
         "podman", "container", "checkpoint",
-        "--print-stats",  # Show detailed timing breakdown
         cont_name
     ]
     # NOTE: Not using --keep so container STOPS and GPU memory is freed
