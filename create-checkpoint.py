@@ -60,26 +60,34 @@ def run_command(cmd: list[str], check: bool = True, capture: bool = False) -> Op
         raise
 
 
-def remove_existing_container(container_name: str) -> None:
-    """Remove existing container if it exists.
+def check_container_exists(container_name: str) -> bool:
+    """Check if container exists.
 
     Args:
-        container_name: Name of container to remove
-    """
-    console.print(f"[yellow]Checking for existing container: {container_name}[/yellow]")
+        container_name: Name of container to check
 
-    # Check if container exists
+    Returns:
+        True if container exists, False otherwise
+    """
     result = subprocess.run(
         ["podman", "ps", "-a", "--filter", f"name=^{container_name}$", "--format", "{{.Names}}"],
         capture_output=True,
         text=True
     )
+    return bool(result.stdout.strip())
 
-    if result.stdout.strip():
-        console.print(f"[yellow]Removing existing container: {container_name}[/yellow]")
-        # Force remove (stop if running, then remove)
-        run_command(["podman", "rm", "-f", container_name], check=False)
-        time.sleep(1)
+
+def remove_existing_container(container_name: str) -> None:
+    """Check for existing container and preserve it if found.
+
+    Args:
+        container_name: Name of container to check
+    """
+    console.print(f"[yellow]Checking for existing container: {container_name}[/yellow]")
+
+    if check_container_exists(container_name):
+        console.print(f"[green]Container {container_name} already exists - PRESERVING IT[/green]")
+        console.print(f"[yellow]Skipping container creation. Using existing container.[/yellow]")
     else:
         console.print(f"[green]No existing container found[/green]")
 
@@ -193,10 +201,13 @@ def create_checkpoint(env_vars: dict[str, str]) -> tuple[str, float]:
 
     cmd = [
         "podman", "container", "checkpoint",
+        "--tcp-established",  # Handle TCP connections properly
+        "--file-locks",       # Checkpoint file locks
         cont_name
     ]
     # NOTE: Not using --keep so container STOPS and GPU memory is freed
     # This ensures we measure TRUE cold start on restore
+    # Using --tcp-established and --file-locks for proper async/multiprocess handling
 
     run_command(cmd)
 
@@ -274,31 +285,41 @@ def main() -> int:
         console.print(f"  Checkpoint: LOCAL (Podman internal storage)")
         console.print()
 
-        # Step 2: Remove existing container
-        console.print("[bold]Step 2: Removing any existing containers[/bold]")
-        remove_existing_container(cont_name)
+        # Step 2: Check for existing container
+        console.print("[bold]Step 2: Checking for existing containers[/bold]")
+        container_exists = check_container_exists(cont_name)
+        if container_exists:
+            console.print(f"[green]Container {cont_name} already exists - PRESERVING IT[/green]")
+            console.print(f"[yellow]Skipping container creation, health check, and warmup[/yellow]")
+            console.print(f"[yellow]Proceeding directly to checkpoint creation[/yellow]")
+        else:
+            console.print(f"[green]No existing container found[/green]")
         console.print()
 
-        # Step 3: Start vLLM container
-        console.print("[bold]Step 3: Starting vLLM container[/bold]")
-        start_vllm_container(env_vars)
-        console.print()
+        # Step 3: Start vLLM container (only if doesn't exist)
+        if not container_exists:
+            console.print("[bold]Step 3: Starting vLLM container[/bold]")
+            start_vllm_container(env_vars)
+            console.print()
 
-        # Step 4: Wait for health check
-        console.print("[bold]Step 4: Waiting for health check[/bold]")
-        try:
-            health_time = utils.wait_for_health(port=api_port, timeout=300)
-            console.print(f"[green]Health check passed in {health_time:.2f}s[/green]")
-        except TimeoutError as e:
-            console.print(f"[red]Health check failed: {e}[/red]")
-            return 1
-        console.print()
+            # Step 4: Wait for health check
+            console.print("[bold]Step 4: Waiting for health check[/bold]")
+            try:
+                health_time = utils.wait_for_health(port=api_port, timeout=300)
+                console.print(f"[green]Health check passed in {health_time:.2f}s[/green]")
+            except TimeoutError as e:
+                console.print(f"[red]Health check failed: {e}[/red]")
+                return 1
+            console.print()
 
-        # Step 5: Run warmup requests
-        console.print("[bold]Step 5: Running warmup inference requests[/bold]")
-        model_id = env_vars.get("MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
-        run_warmup_requests(num_requests=5, port=api_port, model=model_id)
-        console.print()
+            # Step 5: Run warmup requests
+            console.print("[bold]Step 5: Running warmup inference requests[/bold]")
+            model_id = env_vars.get("MODEL_ID", "meta-llama/Llama-3.2-1B-Instruct")
+            run_warmup_requests(num_requests=5, port=api_port, model=model_id)
+            console.print()
+        else:
+            console.print("[bold]Step 3-5: Skipped (container already exists)[/bold]")
+            console.print()
 
         # Step 6: Create checkpoint
         console.print("[bold]Step 6: Creating LOCAL checkpoint[/bold]")
